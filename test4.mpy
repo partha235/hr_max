@@ -12,6 +12,7 @@ i2c.writeto_mem(ADDR, 0x09, b'\x03')
 i2c.writeto_mem(ADDR, 0x0A, b'\x27')
 i2c.writeto_mem(ADDR, 0x0C, b'\x24')
 i2c.writeto_mem(ADDR, 0x0D, b'\x24')
+i2c.writeto_mem(ADDR, 0x0C, b'\x3F')  # stronger LED
 
 def read_fifo():
     data = i2c.readfrom_mem(ADDR, 0x07, 6)
@@ -28,34 +29,31 @@ last_beat = 0
 while True:
     red = read_fifo()
 
-    # ---- Finger detection ----
-    if red < 10000:
-        print("❌ No finger")
-        time.sleep(0.2)
-        continue
-    else:
-        print("🟢 Finger detected")
-
-    # ---- DC removal ----
     avg = alpha * avg + (1 - alpha) * red
     signal = red - avg
 
-    # ---- Pulse detection ----
-    if signal > 150 and prev <= 150:
+    # Finger detection
+    if red < 2000:
+        print("❌ No finger")
+        time.sleep(0.1)
+        continue
+
+    print("🟢 Finger detected")
+
+    # Peak detection
+    if signal > 120 and prev <= 120:
         now = time.ticks_ms()
 
         if last_beat != 0:
-            bpm = 60000 / time.ticks_diff(now, last_beat)
+            diff = time.ticks_diff(now, last_beat)
 
-            # filter unrealistic values
-            if 40 < bpm < 180:
+            if diff > 300:  # debounce
+                bpm = 60000 / diff
                 print("❤️ BPM:", int(bpm))
 
         last_beat = now
 
     prev = signal
-
-    # debug (optional)
     print("Signal:", int(signal))
 
     time.sleep(0.05)

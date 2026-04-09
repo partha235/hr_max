@@ -1,0 +1,64 @@
+from machine import Pin, I2C
+import time
+
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=100000)
+ADDR = 0x57
+
+# --- INIT MAX30102 ---
+i2c.writeto_mem(ADDR, 0x09, b'\x40')  # reset
+time.sleep(1)
+
+i2c.writeto_mem(ADDR, 0x09, b'\x03')  # SPO2 mode
+i2c.writeto_mem(ADDR, 0x0A, b'\x27')  # sample rate
+i2c.writeto_mem(ADDR, 0x0C, b'\x24')  # LED power
+i2c.writeto_mem(ADDR, 0x0D, b'\x24')
+
+def read_fifo():
+    data = i2c.readfrom_mem(ADDR, 0x07, 6)
+    red = (data[0] << 16 | data[1] << 8 | data[2]) & 0x3FFFF
+    return red
+
+# --- FILTER ---
+avg = 0
+alpha = 0.95
+
+prev_signal = 0
+last_beat = 0
+
+finger_count = 0
+NO_FINGER_THRESHOLD = 5000   # adjust if needed
+STABLE_COUNT = 5             # stability filter
+
+while True:
+    red = read_fifo()
+
+    # --- Finger detection using DC level ---
+    if red > NO_FINGER_THRESHOLD:
+        finger_count += 1
+    else:
+        finger_count = 0
+
+    finger_present = finger_count > STABLE_COUNT
+
+    # --- Signal filtering ---
+    avg = alpha * avg + (1 - alpha) * red
+    signal = red - avg
+
+    if finger_present:
+        # --- Peak detection ---
+        if signal > 150 and prev_signal <= 150:
+            now = time.ticks_ms()
+            if last_beat != 0:
+                bpm = 60000 / time.ticks_diff(now, last_beat)
+
+                # Filter unrealistic BPM
+                if 40 < bpm < 180:
+                    print("❤️ BPM:", int(bpm))
+
+            last_beat = now
+
+    else:
+        print("❌ No finger")
+
+    prev_signal = signal
+    time.sleep(0.05)
