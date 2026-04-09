@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <style>
+    .arrows {
+      font-size:40px;
+      color:red;
+    }
+    td.button {
+      background-color:black;
+      border-radius:25%;
+      box-shadow: 5px 5px #888888;
+    }
+    td.button:active {
+      transform: translate(5px,5px);
+      box-shadow: none; 
+    }
+    .noselect {
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      -khtml-user-select: none;
+      -moz-user-select: none;
+      -ms-user-select: none;
+      user-select: none;
+    }
+    .slidecontainer {
+      width: 100%;
+    }
+    .slider {
+      -webkit-appearance: none;
+      width: 100%;
+      height: 15px;
+      border-radius: 5px;
+      background: #d3d3d3;
+      outline: none;
+      opacity: 0.7;
+      -webkit-transition: .2s;
+      transition: opacity .2s;
+    }
+    .slider:hover {
+      opacity: 1;
+    }
+    .slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 25px;
+      height: 25px;
+      border-radius: 50%;
+      background: red;
+      cursor: pointer;
+    }
+    .slider::-moz-range-thumb {
+      width: 25px;
+      height: 25px;
+      border-radius: 50%;
+      background: red;
+      cursor: pointer;
+    }
+    </style>
+  </head>
+  <body class="noselect" align="center" style="background-color:white">
+    <table id="mainTable" style="width:400px;margin:auto;table-layout:fixed" CELLSPACING=10>
+      <tr>
+        <img id="cameraImage" src="/stream" style="width:400px;height:250px"></td>
+      </tr> 
+      <tr>
+        <td></td>
+        <td class="button"><a href="/move?dir=1"><span class="arrows">⇧</span></a></td>
+        <td></td>
+      </tr>
+      <tr>
+        <td class="button"><a href="/move?dir=3"><span class="arrows">⇦</span></a></td>
+        <td class="button"></td>    
+        <td class="button"><a href="/move?dir=4"><span class="arrows">⇨</span></a></td>
+      </tr>
+      <tr>
+        <td></td>
+        <td class="button"><a href="/move?dir=2"><span class="arrows">⇩</span></a></td>
+        <td></td>
+      </tr>
+      <tr/><tr/>
+      <tr>
+        <td style="text-align:left"><b>Speed:</b></td>
+        <td colspan=2>
+         <div class="slidecontainer">
+            <input type="range" min="0" max="1023" value="512" class="slider" id="Speed" oninput='updateSlider("speed", this.value)'>
+          </div>
+        </td>
+      </tr>        
+      <tr>
+        <td style="text-align:left"><b>Light:</b></td>
+        <td colspan=2>
+          <div class="slidecontainer">
+            <input type="range" min="0" max="1023" value="0" class="slider" id="Light" oninput='updateSlider("light", this.value)'>
+          </div>
+        </td>   
+      </tr>
+    </table>
+    <script>
+      function updateSlider(key, value) {
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", "/" + key + "?value=" + value, true);
+        xhr.send();
+      }
+    </script>
+  </body>    
+</html>

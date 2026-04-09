@@ -1,0 +1,79 @@
+# this is for SPO2 read
+from machine import Pin, I2C
+import time
+
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=100000)
+ADDR = 0x57
+
+# --- INIT MAX30102 ---
+i2c.writeto_mem(ADDR, 0x09, b'\x40')
+time.sleep(1)
+
+i2c.writeto_mem(ADDR, 0x09, b'\x03')  # SPO2 mode
+i2c.writeto_mem(ADDR, 0x0A, b'\x27')
+i2c.writeto_mem(ADDR, 0x0C, b'\x24')
+i2c.writeto_mem(ADDR, 0x0D, b'\x24')
+
+def read_fifo():
+    data = i2c.readfrom_mem(ADDR, 0x07, 6)
+    red = (data[0]<<16 | data[1]<<8 | data[2]) & 0x3FFFF
+    ir  = (data[3]<<16 | data[4]<<8 | data[5]) & 0x3FFFF
+    return red, ir
+
+# --- FILTER ---
+avg_red = 0
+avg_ir = 0
+alpha = 0.95
+
+# buffers for AC calculation
+red_ac = []
+ir_ac = []
+
+BUFFER_SIZE = 50
+
+while True:
+    red, ir = read_fifo()
+
+    # --- DC removal (moving average) ---
+    avg_red = alpha * avg_red + (1 - alpha) * red
+    avg_ir  = alpha * avg_ir  + (1 - alpha) * ir
+
+    ac_red = red - avg_red
+    ac_ir  = ir - avg_ir
+
+    red_ac.append(ac_red)
+    ir_ac.append(ac_ir)
+
+    if len(red_ac) > BUFFER_SIZE:
+        red_ac.pop(0)
+        ir_ac.pop(0)
+
+    # --- Finger detection ---
+    if red < 5000:
+        print("❌ No finger")
+        continue
+
+    # --- Compute SpO2 every buffer ---
+    if len(red_ac) == BUFFER_SIZE:
+
+        # AC = RMS (signal strength)
+        ac_red_val = (sum([x*x for x in red_ac]) / BUFFER_SIZE) ** 0.5
+        ac_ir_val  = (sum([x*x for x in ir_ac]) / BUFFER_SIZE) ** 0.5
+
+        # DC = average
+        dc_red = avg_red
+        dc_ir  = avg_ir
+
+        if dc_ir != 0 and ac_ir_val != 0:
+
+            R = (ac_red_val / dc_red) / (ac_ir_val / dc_ir)
+
+            spo2 = 110 - 25 * R
+
+            # clamp realistic values
+            if 80 < spo2 < 100:
+                print("🫁 SpO2:", int(spo2), "%")
+            else:
+                print("⚠️ unstable reading")
+
+    time.sleep(0.05)

@@ -1,3 +1,4 @@
+# this is for BMP reading
 from machine import Pin, I2C
 import time
 
