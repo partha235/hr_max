@@ -1,0 +1,30 @@
+from machine import Pin, I2C
+import max30100
+import time
+
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=100000)
+
+time.sleep(1)
+
+mx30 = max30100.MAX30100(i2c)
+
+mx30.enable_spo2()
+mx30.set_led_current(0, 4.4)
+
+prev = 0
+
+while True:
+    mx30.read_sensor()
+    red = mx30.red
+
+    if red is not None and red > 20:   # filter noise
+        
+        diff = abs(red - prev)
+        prev = red
+
+        if diff > 40:
+            print("❤️ Pulse detected")
+        else:
+            print("Signal:", red)
+
+    time.sleep(0.2)

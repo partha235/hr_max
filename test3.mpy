@@ -1,0 +1,33 @@
+from machine import Pin, I2C
+import time
+
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=100000)
+
+ADDR = 0x57
+
+# Reset
+i2c.writeto_mem(ADDR, 0x09, b'\x40')
+time.sleep(1)
+
+# SpO2 mode
+i2c.writeto_mem(ADDR, 0x09, b'\x03')
+
+# SPO2 config (sample rate + pulse width)
+i2c.writeto_mem(ADDR, 0x0A, b'\x27')
+
+# LED current
+i2c.writeto_mem(ADDR, 0x0C, b'\x24')  # RED
+i2c.writeto_mem(ADDR, 0x0D, b'\x24')  # IR
+
+def read_fifo():
+    data = i2c.readfrom_mem(ADDR, 0x07, 6)
+    
+    red = (data[0] << 16 | data[1] << 8 | data[2]) & 0x3FFFF
+    ir  = (data[3] << 16 | data[4] << 8 | data[5]) & 0x3FFFF
+    
+    return red, ir
+
+while True:
+    red, ir = read_fifo()
+    print("RED:", red, "IR:", ir)
+    time.sleep(0.1)

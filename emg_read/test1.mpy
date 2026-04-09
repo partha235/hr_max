@@ -1,0 +1,21 @@
+from machine import Pin, ADC
+from utime import sleep_ms
+
+adc = ADC(Pin(34))
+adc.atten(ADC.ATTN_11DB)
+
+prev = 0
+THRESHOLD = 20   # adjust if needed
+
+while True:
+    val = adc.read()
+    diff = abs(val - prev)
+    prev = val
+
+    if diff > THRESHOLD:
+        print("💪 Muscle ACTIVE", diff)
+    else:
+        # print("😌 Relaxed", diff)
+        pass
+
+    sleep_ms(50)

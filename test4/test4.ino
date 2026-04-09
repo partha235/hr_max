@@ -1,173 +1,152 @@
 /*
-  MAX30105 – Heart-Rate + SpO₂ on ESP8266 (NodeMCU)
-  SparkFun library + Ratio-of-Ratios algorithm
-  -------------------------------------------------
-  IMPORTANT: Rename BUFFER_LENGTH → SPO2_BUF_LEN
+  Optical SP02 Detection 
 */
-
 #include <Wire.h>
 #include "MAX30105.h"
-#include "heartRate.h"
+#include "spo2_algorithm.h"
 
-MAX30105 sensor;
+MAX30105 particleSensor;
 
-// ---------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------
-const uint8_t BPM_AVG_SIZE = 8;          // moving-average length for BPM
-const uint8_t SPO2_BUF_LEN = 50;         // samples for AC/DC (≈1 s @ 50 Hz)
-const uint8_t SAMPLE_RATE  = 50;         // Hz (default of the library)
+uint32_t irBuffer[100];
+uint32_t redBuffer[100];
 
-// ---------------------------------------------------------------------
-// Globals
-// ---------------------------------------------------------------------
-uint8_t  bpmBuffer[BPM_AVG_SIZE];
-uint8_t  bpmIdx = 0;
-long     lastBeat = 0;
+int32_t bufferLength;
+int32_t spo2;
+int8_t validSPO2;
+int32_t heartRate;
+int8_t validHeartRate;
 
-float    bpm = 0.0;
-int      avgBPM = 0;
-int      spo2 = 0;
-bool     spo2Valid = false;
+byte pulseLED = 2;      // ESP8266 safe pin (D4)
+byte readLED = 16;      // ESP8266 onboard LED (D0)
 
-// AC/DC circular buffers
-int32_t  irBuf[SPO2_BUF_LEN];
-int32_t  redBuf[SPO2_BUF_LEN];
-uint8_t  bufPos = 0;
-bool     bufFull = false;
 
-// ---------------------------------------------------------------------
-// Setup
-// ---------------------------------------------------------------------
-void setup() {
-  Serial.begin(115200);
-  while (!Serial);
+// =========================
+// 🟦 DEBUG WAIT FUNCTION
+// =========================
+bool waitForSample(const char *stage)
+{
+    unsigned long start = millis();
 
-  if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println(F("MAX30105 not found!"));
-    while (1);
-  }
+    while (!particleSensor.available()) {
+        particleSensor.check();
+        yield();
 
-  uint8_t ledBright = 60;
-  uint8_t sampleAvg = 4;
-  uint8_t ledMode   = 2;
-  int     sampleRt  = 100;   // 100 Hz = better SNR
-  int     pulseW    = 411;
-  int     adcRange  = 4096;
-
-  sensor.setup(ledBright, sampleAvg, ledMode, sampleRt, pulseW, adcRange);
-
-  // CRITICAL: Lower IR to avoid saturation
-  sensor.setPulseAmplitudeRed(50);   // ~15 mA
-  sensor.setPulseAmplitudeIR(30);    // ~9 mA  ← KEY FIX
-
-  Serial.println(F("\nMAX30105 ready – Place finger firmly!"));
-}
-
-// ---------------------------------------------------------------------
-// Main loop
-// ---------------------------------------------------------------------
-void loop() {
-  uint32_t ir  = sensor.getIR();
-  uint32_t red = sensor.getRed();
-
-  // ---- Finger detection -------------------------------------------------
-  if (ir < 50000) {
-    Serial.println(F("No finger"));
-    resetAll();
-    return;
-  }
-
-  // ---- Fill circular buffer for SpO₂ ------------------------------------
-  irBuf[bufPos]  = ir;
-  redBuf[bufPos] = red;
-  bufPos = (bufPos + 1) % SPO2_BUF_LEN;
-  if (bufPos == 0) bufFull = true;
-
-  // ---- Heart-rate (IR only) ---------------------------------------------
-  if (checkForBeat(ir)) {
-    long now = millis();
-    if (lastBeat) {
-      long delta = now - lastBeat;
-      bpm = 60.0f * 1000.0f / delta;
-
-      if (bpm > 30 && bpm < 220) {
-        bpmBuffer[bpmIdx++] = (uint8_t)bpm;
-        bpmIdx %= BPM_AVG_SIZE;
-
-        uint32_t sum = 0;
-        for (uint8_t i = 0; i < BPM_AVG_SIZE; ++i) sum += bpmBuffer[i];
-        avgBPM = sum / BPM_AVG_SIZE;
-      }
+        if (millis() - start > 1200) {  // 1.2 sec timeout
+            Serial.print("⚠ TIMEOUT in stage: ");
+            Serial.println(stage);
+            return false;
+        }
     }
-    lastBeat = now;
-  }
 
-  // ---- SpO₂ (only when we have a full window) ---------------------------
-  if (bufFull) {
-    spo2Valid = calcSpO2(irBuf, redBuf, SPO2_BUF_LEN, &spo2);
-  }
-
-  // ---- Serial output ----------------------------------------------------
-  Serial.print(F("IR="));   Serial.print(ir);
-  Serial.print(F("\tRed="));Serial.print(red);
-  Serial.print(F("\tBPM="));Serial.print(bpm, 1);
-  Serial.print(F("\tAvg="));Serial.print(avgBPM);
-  Serial.print(F("\tSpO2="));
-  if (spo2Valid) {
-    Serial.print(spo2); Serial.print(F("%"));
-  } else {
-    Serial.print(F("--"));
-  }
-  Serial.println();
+    return true;
 }
 
-// ---------------------------------------------------------------------
-// SpO₂ – Ratio-of-Ratios (same as Maxim reference)
-// ---------------------------------------------------------------------
-bool calcSpO2(int32_t *ir, int32_t *red, int len, int *out) {
-  int32_t irMin =  1000000, irMax = 0;
-  int32_t redMin = 1000000, redMax = 0;
-  float   irDC = 0, redDC = 0;
 
-  for (int i = 0; i < len; ++i) {
-    int32_t v = ir[i];
-    irDC += v;
-    if (v < irMin) irMin = v;
-    if (v > irMax) irMax = v;
+void setup()
+{
+    Serial.begin(115200);
+    delay(300);
 
-    v = red[i];
-    redDC += v;
-    if (v < redMin) redMin = v;
-    if (v > redMax) redMax = v;
-  }
+    Serial.println("\n=== ESP8266 MAX30102 DEBUG START ===");
 
-  irDC  /= len;
-  redDC /= len;
+    pinMode(pulseLED, OUTPUT);
+    pinMode(readLED, OUTPUT);
 
-  float irAC  = irMax  - irMin;
-  float redAC = redMax - redMin;
+    if (!particleSensor.begin(Wire, I2C_SPEED_FAST))
+    {
+        Serial.println("❌ MAX30102 not found!");
+        while (1) yield();
+    }
 
-  // weak signal → discard
-  if (irAC < 500 || redAC < 500 || irDC < 50000 || redDC < 50000) return false;
+    Serial.println("Sensor Found. Press any key to continue...");
+    while (Serial.available() == 0) yield();
+    Serial.read();
 
-  float R = (redAC / redDC) / (irAC / irDC);
-  *out = (int)(110.0 - 25.0 * R);
-  if (*out > 100) *out = 100;
-  if (*out <  70) *out =  70;
-
-  return (*out >= 90 && *out <= 100);
+    particleSensor.setup(60, 4, 2, 50, 411, 4096); 
+    Serial.println("Sensor Initialized.");
 }
 
-// ---------------------------------------------------------------------
-// Reset everything when the finger is removed
-// ---------------------------------------------------------------------
-void resetAll() {
-  bufPos = 0;
-  bufFull = false;
-  lastBeat = 0;
-  spo2Valid = false;
-  spo2 = 0;
-  bpm = 0;
-  avgBPM = 0;
+
+
+void loop()
+{
+    bufferLength = 100;
+
+    Serial.println("🟩 Stage 1: Reading first 100 samples...");
+
+    for (byte i = 0 ; i < bufferLength ; i++)
+    {
+        if (!waitForSample("INITIAL READ")) return;
+
+        redBuffer[i] = particleSensor.getRed();
+        irBuffer[i]  = particleSensor.getIR();
+        particleSensor.nextSample();
+
+        if (i % 10 == 0) {  // print every 10th sample
+            Serial.print("i=");
+            Serial.print(i);
+            Serial.print("  red=");
+            Serial.print(redBuffer[i]);
+            Serial.print("  ir=");
+            Serial.println(irBuffer[i]);
+        }
+    }
+
+    Serial.println("🟩 Stage 2: Running SPO2 algorithm...");
+    maxim_heart_rate_and_oxygen_saturation(
+        irBuffer, bufferLength, redBuffer, &spo2, &validSPO2,
+        &heartRate, &validHeartRate
+    );
+
+
+    Serial.println("🟩 Stage 3: Entering continuous loop...");
+
+    // ============================
+    //   MAIN SAFE AND DEBUG LOOP
+    // ============================
+
+    while (true)
+    {
+        // Shift old samples
+        for (byte i = 25; i < 100; i++)
+        {
+            redBuffer[i - 25] = redBuffer[i];
+            irBuffer[i - 25]  = irBuffer[i];
+        }
+
+        // Take 25 new samples
+        for (byte i = 75; i < 100; i++)
+        {
+            if (!waitForSample("CONTINUOUS READ")) {
+                Serial.println("⚠ BREAK TO AVOID WDT");
+                return;
+            }
+
+            digitalWrite(readLED, !digitalRead(readLED));
+
+            redBuffer[i] = particleSensor.getRed();
+            irBuffer[i]  = particleSensor.getIR();
+            particleSensor.nextSample();
+
+            if (i % 5 == 0) {
+                Serial.print("idx=");
+                Serial.print(i);
+                Serial.print("  HR=");
+                Serial.print(heartRate);
+                Serial.print("  SpO2=");
+                Serial.println(spo2);
+            }
+
+            yield();
+        }
+
+        // Recalculate
+        Serial.println("🔄 Recalculating SPO2 + HR...");
+        maxim_heart_rate_and_oxygen_saturation(
+            irBuffer, bufferLength, redBuffer, &spo2, &validSPO2,
+            &heartRate, &validHeartRate
+        );
+
+        yield();
+    }
 }
