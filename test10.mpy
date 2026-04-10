@@ -1,0 +1,248 @@
+# ==========================================
+# ESP32 MAX30102 + DS18B20 + Real-Time WebSocket
+# Optimized for fast BPM/SpO2 response
+# ==========================================
+
+from machine import Pin, I2C
+import onewire, ds18x20
+import time, network, gc, json, usocket as socket, hashlib, binascii
+
+# --- Configuration ---
+SSID = 'bps_wifi'
+PASSWORD = 'sagabps@235'
+MAX_ADDR = 0x57
+BUFFER_SIZE = 50  # smaller for faster SpO2 response
+THRESHOLD = 150   # beat detection threshold
+ALPHA = 0.95      # DC filter
+
+# --- Wi-Fi Setup ---
+sta = network.WLAN(network.STA_IF)
+sta.active(True)
+sta.connect(SSID, PASSWORD)
+
+print("Connecting...")
+retry = 0
+while not sta.isconnected() and retry < 10:
+    time.sleep(1)
+    retry += 1
+print("Connected! IP:", sta.ifconfig()[0])
+
+# --- MAX30102 I2C Setup ---
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=400000)
+
+def init_max30102():
+    i2c.writeto_mem(MAX_ADDR, 0x09, b'\x40'); time.sleep(0.2)  # reset
+    i2c.writeto_mem(MAX_ADDR, 0x09, b'\x03')                  # mode SpO2
+    i2c.writeto_mem(MAX_ADDR, 0x0A, b'\x47')                  # SpO2 config
+    i2c.writeto_mem(MAX_ADDR, 0x0C, b'\x24')                  # LED Red
+    i2c.writeto_mem(MAX_ADDR, 0x0D, b'\x24')                  # LED IR
+    i2c.writeto_mem(MAX_ADDR, 0x04, b'\x00')                  # clear FIFO
+    i2c.writeto_mem(MAX_ADDR, 0x05, b'\x00')
+    i2c.writeto_mem(MAX_ADDR, 0x06, b'\x00')
+
+init_max30102()
+
+def read_fifo():
+    try:
+        data = i2c.readfrom_mem(MAX_ADDR, 0x07, 6)
+        red = (data[0]<<16 | data[1]<<8 | data[2]) & 0x3FFFF
+        ir  = (data[3]<<16 | data[4]<<8 | data[5]) & 0x3FFFF
+        return red, ir
+    except:
+        return 0,0
+
+def read_fifo_batch(n=3):
+    r_sum = i_sum = 0
+    for _ in range(n):
+        r,i = read_fifo()
+        r_sum += r
+        i_sum += i
+    return r_sum//n, i_sum//n
+
+# --- DS18B20 Setup ---
+ds_pin = Pin(4)
+ds_sensor = ds18x20.DS18X20(onewire.OneWire(ds_pin))
+roms = ds_sensor.scan()
+print("DS18B20 found:", roms)
+
+# --- Global State ---
+avg_red = avg_ir = 0.0
+red_ac = []
+ir_ac = []
+bpm_list = []
+last_beat = 0
+prev_signal = 0
+bpm = '--'
+spo2 = '--'
+temperature = 0.0
+finger_count = 0
+STABLE_COUNT = 5
+temp_convert_start = 0
+ws_clients = []
+
+# --- HTML Page ---
+def get_html():
+    return """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Pulse Ox</title>
+<style>
+body{font-family:sans-serif;text-align:center;background:#f4f4f9;padding:20px;}
+.card{background:white;padding:20px;border-radius:15px;box-shadow:0 4px 10px rgba(0,0,0,0.1);display:inline-block;}
+.val{font-size:3em;font-weight:bold;color:#e74c3c;}
+.unit{font-size:0.5em;color:#777;}
+.label{color:#555;text-transform:uppercase;font-size:0.9em;letter-spacing:1px;}
+</style></head>
+<body>
+<div class="card">
+<h1>Health Monitor</h1>
+<p class="label">Heart Rate</p><div class="val" id="bpm">--</div>
+<p class="label">Oxygen (SpO2)</p><div class="val" id="spo2">--<span class="unit">%</span></div>
+<p class="label">Body Temp</p><div class="val" id="temp">--<span class="unit">°C</span></div>
+<p id="stat">Connecting...</p>
+</div>
+<script>
+let ws=new WebSocket('ws://'+location.host+'/ws');
+ws.onmessage=e=>{let d=JSON.parse(e.data);document.getElementById('bpm').innerText=d.bpm;document.getElementById('spo2').innerHTML=d.spo2+'<span class="unit">%</span>';document.getElementById('temp').innerHTML=d.temp+'<span class="unit">°C</span>';document.getElementById('stat').innerText="✅ Live";};
+ws.onclose=()=>{document.getElementById('stat').innerText="❌ Disconnected";};
+</script></body></html>"""
+
+# --- WebSocket Helpers ---
+def send_ws(client, data):
+    msg = json.dumps(data).encode()
+    length = len(msg)
+    frame = bytearray([0x81])
+    if length < 126:
+        frame.append(length)
+    elif length < 65536:
+        frame.append(126)
+        frame += length.to_bytes(2,'big')
+    else:
+        frame.append(127)
+        frame += length.to_bytes(8,'big')
+    frame += msg
+    client.send(frame)
+
+def broadcast(data):
+    for c in ws_clients[:]:
+        try: send_ws(c, data)
+        except: ws_clients.remove(c)
+
+# --- Sensor Update ---
+def update_sensors():
+    global avg_red, avg_ir, prev_signal, last_beat, bpm, spo2, temperature, finger_count, temp_convert_start
+
+    red, ir = read_fifo_batch(3)
+
+    # Finger detection
+    if ir > 35000:
+        finger_count = min(finger_count+1, STABLE_COUNT+2)
+    else:
+        finger_count = max(finger_count-1,0)
+    finger_present = finger_count >= STABLE_COUNT
+
+    # DC filtering
+    avg_red = ALPHA*avg_red + (1-ALPHA)*red
+    avg_ir  = ALPHA*avg_ir  + (1-ALPHA)*ir
+    ac_red = red - avg_red
+    ac_ir  = ir - avg_ir
+
+    # AC buffers
+    red_ac.append(ac_red)
+    ir_ac.append(ac_ir)
+    if len(red_ac) > BUFFER_SIZE:
+        red_ac.pop(0)
+        ir_ac.pop(0)
+
+    # BPM detection
+    if finger_present:
+        if ac_red>THRESHOLD and prev_signal<=THRESHOLD:
+            now = time.ticks_ms()
+            if last_beat>0:
+                diff = time.ticks_diff(now,last_beat)
+                if 300<diff<2000:
+                    cur_bpm = 60000/diff
+                    bpm_list.append(cur_bpm)
+                    if len(bpm_list)>5: bpm_list.pop(0)
+                    bpm = int(sum(bpm_list)/len(bpm_list))
+            last_beat = now
+    else:
+        bpm = '--'
+        spo2 = '--'
+        bpm_list.clear()
+
+    prev_signal = ac_red
+
+    # SpO2 calculation
+    if finger_present and len(red_ac)==BUFFER_SIZE:
+        red_rms = (sum(x*x for x in red_ac)/BUFFER_SIZE)**0.5
+        ir_rms  = (sum(x*x for x in ir_ac)/BUFFER_SIZE)**0.5
+        if avg_ir>0 and ir_rms>0:
+            R = (red_rms/avg_red)/(ir_rms/avg_ir)
+            val = 104 - (17*R)
+            spo2 = int(val) if 80<val<100 else 99
+
+    # DS18B20 async read
+    now_ms = time.ticks_ms()
+    if now_ms - temp_convert_start > 2000:
+        ds_sensor.convert_temp()
+        temp_convert_start = now_ms
+    elif 750 < now_ms - temp_convert_start < 2000 and roms:
+        temperature = round(ds_sensor.read_temp(roms[0]),1)
+
+    return {"bpm": bpm, "spo2": spo2, "temp": temperature}
+
+# --- Server Setup ---
+s = socket.socket()
+s.setblocking(False)
+s.bind(('0.0.0.0', 80))
+s.listen(5)
+print("System Active...")
+
+last_print = 0
+
+while True:
+    try:
+        data = update_sensors()
+
+        # Accept connections
+        try:
+            conn, addr = s.accept()
+            conn.settimeout(0.5)
+            request = conn.recv(1024)
+            if b'GET /ws' in request:
+                key = None
+                for line in request.split(b'\r\n'):
+                    if b'Sec-WebSocket-Key' in line:
+                        key = line.split(b": ")[1]
+                        break
+                if key:
+                    accept = binascii.b2a_base64(
+                        hashlib.sha1(key+b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest()
+                    ).strip()
+                    response = (b'HTTP/1.1 101 Switching Protocols\r\n'
+                                b'Upgrade: websocket\r\n'
+                                b'Connection: Upgrade\r\n'
+                                b'Sec-WebSocket-Accept: ' + accept + b'\r\n\r\n')
+                    conn.send(response)
+                    ws_clients.append(conn)
+            else:
+                # Serve HTML
+                conn.send(b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n")
+                conn.send(get_html().encode())
+                conn.close()
+        except OSError:
+            pass
+
+        # Broadcast to WebSocket
+        broadcast(data)
+
+        # Debug print every second
+        if time.ticks_ms() - last_print > 1000:
+            print(f"BPM: {data['bpm']} | SpO2: {data['spo2']}% | Temp: {data['temp']}C")
+            last_print = time.ticks_ms()
+
+        time.sleep_ms(40)
+        gc.collect()
+
+    except Exception as e:
+        print("Loop Error:", e)
+        time.sleep(1)
